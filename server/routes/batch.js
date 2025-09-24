@@ -61,6 +61,48 @@ router.get('/', async (req, res, next) => {
   }
 });
 
+// On-chain events for a batch
+router.get('/:id/events', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { ethersCtx } = req.context;
+    const { contract, provider } = ethersCtx;
+    if (!contract) return res.json({ events: [] });
+
+    const fromBlock = 0; // for demo/local chain
+    const toBlock = 'latest';
+
+    const events = [];
+    const pushWithTs = async (log, type) => {
+      const block = await provider.getBlock(log.blockNumber);
+      events.push({
+        type,
+        txHash: log.transactionHash,
+        blockNumber: log.blockNumber,
+        timestamp: block?.timestamp ? Number(block.timestamp) * 1000 : Date.now(),
+        args: log.args
+      });
+    };
+
+    const created = await contract.queryFilter(contract.filters.BatchCreated(id), fromBlock, toBlock);
+    for (const log of created) await pushWithTs(log, 'BatchCreated');
+
+    const transfers = await contract.queryFilter(contract.filters.OwnershipTransferred(id, null, null), fromBlock, toBlock);
+    for (const log of transfers) await pushWithTs(log, 'OwnershipTransferred');
+
+    const status = await contract.queryFilter(contract.filters.StatusUpdated(id, null), fromBlock, toBlock);
+    for (const log of status) await pushWithTs(log, 'StatusUpdated');
+
+    const prices = await contract.queryFilter(contract.filters.PriceUpdated(id, null), fromBlock, toBlock);
+    for (const log of prices) await pushWithTs(log, 'PriceUpdated');
+
+    events.sort((a, b) => a.blockNumber - b.blockNumber);
+    res.json({ events });
+  } catch (err) {
+    next(err);
+  }
+});
+
 export default router;
 
 

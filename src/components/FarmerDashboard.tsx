@@ -6,7 +6,6 @@ import {
   Package, 
   QrCode, 
   MapPin, 
-  Calendar,
   Thermometer,
   Droplets,
   Wind,
@@ -20,6 +19,7 @@ import QRCode from 'qrcode';
 import { useAuth } from '../context/AuthContext';
 import axios from 'axios';
 import { io as socketIO } from 'socket.io-client';
+import { createBatchOnChain, transferOwnershipOnChain } from '../lib/contract';
 
 interface ProduceBatch {
   id: string;
@@ -37,6 +37,9 @@ const FarmerDashboard: React.FC = () => {
   const { user, logout, token } = useAuth();
   const [activeTab, setActiveTab] = useState('dashboard');
   const [batches, setBatches] = useState<ProduceBatch[]>([]);
+  const [creating, setCreating] = useState(false);
+  const [, setTransferringId] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ type: 'success' | 'error'; msg: string } | null>(null);
 
   const [formData, setFormData] = useState({
     cropType: '',
@@ -56,13 +59,13 @@ const FarmerDashboard: React.FC = () => {
     { time: '20:00', temperature: 20, humidity: 62, gas: 0.1 },
   ]);
 
-  const API_BASE = (import.meta as any).env?.VITE_API_BASE || 'http://localhost:4000';
+  const API_BASE = (import.meta as unknown as { env?: { VITE_API_BASE?: string } }).env?.VITE_API_BASE || 'http://localhost:4000';
 
   useEffect(() => {
     if (!token) return;
     const client = axios.create({ baseURL: `${API_BASE}/api`, headers: { Authorization: `Bearer ${token}` } });
-    client.get('/batches').then(({ data }) => {
-      const items = (data.items || []).map((d: any) => ({
+    client.get('/batches').then(({ data }: { data: { items: Array<{ batchId: string; product: string; harvestDate: string; quantity: number; price: number; location: string; status: 'Created' | 'In Transit' | 'Sold' }> } }) => {
+      const items = (data.items || []).map((d) => ({
         id: d.batchId,
         cropType: d.product,
         harvestDate: d.harvestDate,
@@ -75,13 +78,13 @@ const FarmerDashboard: React.FC = () => {
     });
 
     const socket = socketIO(API_BASE, { transports: ['websocket'] });
-    socket.on('sensor:update', (doc: any) => {
+    socket.on('sensor:update', (doc: { createdAt: string; temperature?: number; humidity?: number; gas?: number }) => {
       if (!doc) return;
       const time = new Date(doc.createdAt).toTimeString().slice(0,5);
       setSensorData(prev => [...prev.slice(-5), { time, temperature: doc.temperature ?? 22, humidity: doc.humidity ?? 60, gas: doc.gas ?? 0.2 }]);
     });
     return () => { socket.disconnect(); };
-  }, [token]);
+  }, [token, API_BASE]);
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     setFormData({
@@ -92,25 +95,44 @@ const FarmerDashboard: React.FC = () => {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const client = axios.create({ baseURL: `${API_BASE}/api`, headers: { Authorization: `Bearer ${token}` } });
-    const { data } = await client.post('/batches', {
-      cropType: formData.cropType,
-      harvestDate: formData.harvestDate,
-      quantity: parseInt(formData.quantity),
-      price: parseFloat(formData.price),
-      location: formData.location,
-    });
-    const d = data.item;
-    const newBatch: ProduceBatch = {
-      id: d.batchId,
-      cropType: d.product,
-      harvestDate: d.harvestDate,
-      quantity: d.quantity,
-      price: d.price,
-      location: d.location,
-      status: d.status,
-    };
-    setBatches([...batches, newBatch]);
+    const batchId = `${formData.cropType.substring(0, 3).toUpperCase()}-2025-${String(Date.now()).slice(-6)}`;
+    try {
+      setCreating(true);
+      const txHash = await createBatchOnChain({
+        batchId,
+        product: formData.cropType,
+        location: formData.location,
+        harvestDate: formData.harvestDate,
+        quantity: parseInt(formData.quantity),
+        pricePerKg: parseFloat(formData.price),
+      });
+      const client = axios.create({ baseURL: `${API_BASE}/api`, headers: { Authorization: `Bearer ${token}` } });
+      await client.post('/batches', {
+        cropType: formData.cropType,
+        harvestDate: formData.harvestDate,
+        quantity: parseInt(formData.quantity),
+        price: parseFloat(formData.price),
+        location: formData.location,
+      });
+      // Refresh from server to ensure consistency
+      const list = await client.get('/batches');
+      const items = (list.data.items || []).map((x: { batchId: string; product: string; harvestDate: string; quantity: number; price: number; location: string; status: 'Created' | 'In Transit' | 'Sold' }) => ({
+        id: x.batchId,
+        cropType: x.product,
+        harvestDate: x.harvestDate,
+        quantity: x.quantity,
+        price: x.price,
+        location: x.location,
+        status: x.status,
+      }));
+      setBatches(items);
+      console.log('On-chain tx:', txHash);
+      setToast({ type: 'success', msg: `Batch created on-chain. Tx: ${txHash.slice(0, 10)}...` });
+    } catch (err) {
+      console.error('Create batch failed:', err);
+      setToast({ type: 'error', msg: 'Failed to create batch. Check wallet/network and try again.' });
+    }
+    setCreating(false);
     setFormData({ cropType: '', harvestDate: '', quantity: '', price: '', location: 'Pune, Maharashtra' });
     setActiveTab('produce');
   };
@@ -148,10 +170,24 @@ const FarmerDashboard: React.FC = () => {
   };
 
   const transferOwnership = async (batchId: string) => {
-    const client = axios.create({ baseURL: `${API_BASE}/api`, headers: { Authorization: `Bearer ${token}` } });
-    const { data } = await client.post(`/batches/${encodeURIComponent(batchId)}/status`, { status: 'In Transit' });
-    const d = data.item;
-    if (d) setBatches(batches.map(b => b.id === batchId ? { ...b, status: 'In Transit' } : b));
+    try {
+      const provider = (window as unknown as { ethereum?: { selectedAddress?: string; accounts?: string[] } }).ethereum;
+      const suggested = provider?.selectedAddress || (provider?.accounts && provider.accounts[0]) || '';
+      const to = window.prompt('Enter destination wallet address', suggested) || '';
+      if (!to) return;
+      setTransferringId(batchId);
+      const txHash = await transferOwnershipOnChain(batchId, to);
+      const client = axios.create({ baseURL: `${API_BASE}/api`, headers: { Authorization: `Bearer ${token}` } });
+      const { data } = await client.post(`/batches/${encodeURIComponent(batchId)}/status`, { status: 'In Transit' });
+      const d = data.item;
+      if (d) setBatches(batches.map(b => b.id === batchId ? { ...b, status: 'In Transit' } : b));
+      console.log('Transfer tx:', txHash);
+      setToast({ type: 'success', msg: `Transferred. Tx: ${txHash.slice(0, 10)}...` });
+    } catch (err) {
+      console.error('Transfer failed:', err);
+      setToast({ type: 'error', msg: 'Transfer failed. Check address and confirm tx in wallet.' });
+    }
+    setTransferringId(null);
   };
 
   const getStatusColor = (status: string) => {
@@ -193,6 +229,11 @@ const FarmerDashboard: React.FC = () => {
       </nav>
 
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {toast && (
+          <div className={`mb-4 p-3 rounded ${toast.type==='success'?'bg-green-50 text-green-700':'bg-red-50 text-red-700'}`}>
+            {toast.msg}
+          </div>
+        )}
         {/* Tab Navigation */}
         <div className="bg-white rounded-lg shadow-sm mb-8">
           <div className="border-b border-gray-200">
@@ -422,10 +463,11 @@ const FarmerDashboard: React.FC = () => {
 
                 <button
                   type="submit"
-                  className="w-full bg-green-600 text-white py-3 px-6 rounded-lg hover:bg-green-700 transition-colors flex items-center justify-center"
+                  disabled={creating}
+                  className={`w-full ${creating ? 'bg-green-400' : 'bg-green-600 hover:bg-green-700'} text-white py-3 px-6 rounded-lg transition-colors flex items-center justify-center`}
                 >
                   <Save className="h-5 w-5 mr-2" />
-                  Create Batch
+                  {creating ? 'Creating...' : 'Create Batch'}
                 </button>
               </form>
             </div>
@@ -490,14 +532,13 @@ const FarmerDashboard: React.FC = () => {
                           >
                             <QrCode className="h-4 w-4" />
                           </button>
-                          {batch.status === 'Created' && (
-                            <button
-                              onClick={() => transferOwnership(batch.id)}
-                              className="bg-green-600 text-white px-3 py-1 rounded hover:bg-green-700 transition-colors"
-                            >
-                              <Send className="h-4 w-4" />
-                            </button>
-                          )}
+                          <button
+                            onClick={() => transferOwnership(batch.id)}
+                            className="bg-green-600 text-white px-3 py-1 rounded hover:bg-green-700 transition-colors"
+                            title="Transfer ownership"
+                          >
+                            <Send className="h-4 w-4" />
+                          </button>
                         </div>
                       </td>
                     </tr>

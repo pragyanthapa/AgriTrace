@@ -21,7 +21,7 @@ import {
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { Html5QrcodeScanner } from 'html5-qrcode';
 import WalletConnect from './WalletConnect';
-import { fetchBatch, fetchLatestBatches } from '../lib/api';
+import { fetchBatch, fetchLatestBatches, fetchBatchEvents } from '../lib/api';
 import { io as socketIO } from 'socket.io-client';
 
 interface BatchDetails {
@@ -50,6 +50,7 @@ const BuyerDashboard: React.FC = () => {
   const [activeTab, setActiveTab] = useState('scan');
   const [searchId, setSearchId] = useState('');
   const [batchDetails, setBatchDetails] = useState<BatchDetails | null>(null);
+  const [events, setEvents] = useState<Array<{ type: string; txHash: string; timestamp: number }>>([]);
   const [isScanning, setIsScanning] = useState(false);
   const scannerRef = useRef<Html5QrcodeScanner | null>(null);
   const [latest, setLatest] = useState<Array<{ batchId: string; product: string; farmer: string; location: string; price: number }>>([]);
@@ -125,21 +126,30 @@ const BuyerDashboard: React.FC = () => {
     ]
   };
 
-  const handleSearch = async () => {
-    if (!searchId.trim()) return;
-    const data = await fetchBatch(searchId.trim());
-    const merged = {
-      ...mockBatchData,
-      batchId: data.batchId,
-      product: data?.offchain?.product || mockBatchData.product,
-      farmer: data?.offchain?.farmer || mockBatchData.farmer,
-      location: data?.offchain?.location || mockBatchData.location,
-      harvestDate: data?.offchain?.harvestDate || mockBatchData.harvestDate,
-      price: data?.onchain?.pricePerKg ?? mockBatchData.price,
-      timeline: mockBatchData.timeline,
-    } as BatchDetails;
-    setBatchDetails(merged);
-    setActiveTab('details');
+  const handleSearch = async (idOverride?: string) => {
+    const id = (idOverride ?? searchId).trim();
+    if (!id) return;
+    try {
+      const data = await fetchBatch(id);
+      const merged = {
+        ...mockBatchData,
+        batchId: data.batchId,
+        product: data?.offchain?.product || mockBatchData.product,
+        farmer: data?.offchain?.farmer || mockBatchData.farmer,
+        location: data?.offchain?.location || mockBatchData.location,
+        harvestDate: data?.offchain?.harvestDate || mockBatchData.harvestDate,
+        price: data?.onchain?.pricePerKg ?? mockBatchData.price,
+        timeline: mockBatchData.timeline,
+      } as BatchDetails;
+      setBatchDetails(merged);
+      const ev = await fetchBatchEvents(merged.batchId);
+      setEvents(ev.events.map(e => ({ type: e.type, txHash: e.txHash, timestamp: e.timestamp })));
+    } catch (e) {
+      // fall back to showing minimal info with the ID
+      setBatchDetails({ ...mockBatchData, batchId: id });
+    } finally {
+      setActiveTab('details');
+    }
   };
 
   const startQRScanner = () => {
@@ -167,6 +177,8 @@ const BuyerDashboard: React.FC = () => {
             farmer: data?.offchain?.farmer || mockBatchData.farmer,
           } as BatchDetails;
           setBatchDetails(merged);
+          const ev = await fetchBatchEvents(merged.batchId);
+          setEvents(ev.events.map(e => ({ type: e.type, txHash: e.txHash, timestamp: e.timestamp })));
           setActiveTab('details');
         } finally {
           scanner.clear();
@@ -274,7 +286,25 @@ const BuyerDashboard: React.FC = () => {
                         <div className="font-medium text-gray-900">{item.product}</div>
                         <div className="text-sm text-gray-600">{item.batchId} • {item.farmer} • {item.location}</div>
                       </div>
-                      <button onClick={() => { setSearchId(item.batchId); handleSearch(); }} className="bg-green-600 text-white px-3 py-1 rounded">View</button>
+                      <button
+                        onClick={() => {
+                          // show immediate details using list data, then hydrate
+                          setBatchDetails({
+                            ...mockBatchData,
+                            batchId: item.batchId,
+                            product: item.product,
+                            farmer: item.farmer,
+                            location: item.location,
+                            price: item.price,
+                          } as BatchDetails);
+                          setActiveTab('details');
+                          setSearchId(item.batchId);
+                          handleSearch(item.batchId);
+                        }}
+                        className="bg-green-600 text-white px-3 py-1 rounded"
+                      >
+                        View
+                      </button>
                     </div>
                   ))}
                 </div>
@@ -515,27 +545,20 @@ const BuyerDashboard: React.FC = () => {
           <div className="max-w-4xl mx-auto">
             <div className="bg-white rounded-lg shadow-sm p-8">
               <h2 className="text-2xl font-bold text-gray-900 mb-8">Provenance Timeline</h2>
-              <div className="space-y-8">
-                {batchDetails.timeline.map((item, index) => (
-                  <div key={index} className="flex items-start">
-                    <div className={`flex-shrink-0 w-4 h-4 rounded-full mt-1 ${
-                      item.status === 'completed' ? 'bg-green-500' :
-                      item.status === 'current' ? 'bg-blue-500' :
-                      'bg-gray-300'
-                    }`}></div>
+              <div className="space-y-6">
+                {events.map((e, i) => (
+                  <div key={i} className="flex items-start">
+                    <div className="flex-shrink-0 w-4 h-4 rounded-full mt-1 bg-green-500"></div>
                     <div className="ml-6">
-                      <div className={`font-semibold ${
-                        item.status === 'completed' ? 'text-green-900' :
-                        item.status === 'current' ? 'text-blue-900' :
-                        'text-gray-500'
-                      }`}>
-                        {item.event}
-                      </div>
-                      <div className="text-sm text-gray-600 mt-1">{item.date}</div>
-                      <div className="text-sm text-gray-500">{item.location}</div>
+                      <div className="font-semibold text-gray-900">{e.type}</div>
+                      <div className="text-sm text-gray-600 mt-1">{new Date(e.timestamp).toLocaleString()}</div>
+                      <div className="text-xs text-gray-500 break-all">Tx: {e.txHash}</div>
                     </div>
                   </div>
                 ))}
+                {events.length === 0 && (
+                  <div className="text-gray-500 text-sm">No on-chain events found for this batch yet.</div>
+                )}
               </div>
             </div>
           </div>
